@@ -1,6 +1,38 @@
 {
   "test" : {
-    "name" : "tests",
-    "description" : "desc"
+    "name" : "test",
+    "description" : "Testing commands"
+  },
+  "test2" : {
+    "name" : "test2",
+    "description" : "Testing commands"
+  },
+  "test3" : {
+    "name" : "test3",
+    "description" : "Testing commands"
+  },
+  "test4" : {
+    "name" : "test4",
+    "description" : "Testing commands"
+  },
+  "test5" : {
+    "name" : "test5",
+    "description" : "Testing commands"
+  },
+  "pause" : {
+    "name": "pause",
+    "description" : "Pause / Resume the songs"
+  },
+  "skip" : {
+    "name": "skip",
+    "description" : "Skips the current song"
+  },
+  "stop" : {
+    "name": "stop",
+    "description" : "Cleans the queue and ends the current song"
+  },
+  "play" : {
+    "name": "play",
+    "description" : "Adds a song to the queue"
   }
 }
