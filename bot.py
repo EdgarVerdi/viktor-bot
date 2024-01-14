@@ -2,7 +2,7 @@ import nextcord
 import os
 from nextcord.ext import commands
 import json
-
+import logging
 
 def getJson(path):
     if os.path.exists(path):
@@ -17,6 +17,7 @@ class BotMain:
         beta = True
         prefixes = ['b!', 'B!'] if beta else ['v!', 'V!']
         token_key = "viktor-beta" if beta else "viktor"
+        self.path = os.path.dirname(os.path.abspath(__file__))
 
         intents = nextcord.Intents.all()
         self.description = "Testing out the waters"
@@ -25,8 +26,14 @@ class BotMain:
         self.client.event(self.on_ready)
         self.__addCogs()
 
-        token = getJson("./cred/dicord_tokens.json").get(token_key, None)
+        token = getJson(self.path+"/cred/dicord_tokens.json").get(token_key, None)
         self.client.run(token)
+
+        logger = logging.getLogger('nextcord')
+        logger.setLevel(logging.DEBUG)
+        handler = logging.FileHandler(filename='nextcord.log', encoding='utf-8', mode='w')
+        handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s'))
+        logger.addHandler(handler)
 
     def __addCogs(self):
         dir_path = os.path.dirname(os.path.realpath(__file__))

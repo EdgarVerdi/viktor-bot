@@ -11,7 +11,7 @@ def getJson(path):
         return {}
 
 
-def formatDuration(seconds):
+def formatDuration(seconds: int | float):
     minutes = seconds // 60
     seconds = seconds % 60
     if minutes >= 60:

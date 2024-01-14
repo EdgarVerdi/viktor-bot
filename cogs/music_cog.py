@@ -1,10 +1,12 @@
+import queue
 from typing import Tuple
 
 import nextcord
 from nextcord.ext.commands import Cog
-from nextcord import Interaction, Embed, VoiceChannel, VoiceClient, Guild, TextChannel, FFmpegPCMAudio, User, Color
+from nextcord import Interaction, Embed, VoiceChannel, VoiceClient, Guild, TextChannel, FFmpegPCMAudio, User, Color, \
+    SlashOption
 from lib.command_decorators import slash_command
-from lib.functions import formatDuration, isUrlValid
+from lib.functions import formatDuration, isUrlValid, getJson
 from queue import Queue
 from enum import Enum
 from yt_dlp import YoutubeDL
@@ -12,6 +14,8 @@ from abc import ABC as ABSTRACT, abstractmethod
 import re
 import threading
 from typing import Optional, Union
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
 
 class UserNotInVoiceChannel(Exception):
@@ -35,16 +39,18 @@ class UnavailableSourceException(Exception):
 
 
 class LoopMode(Enum):
-    Disabled = 0,
-    Song = 1,
+    Disabled = 0
+    Song = 1
     Queue = 2
 
 
 class MediaType(Enum):
-    Song = 0,
-    Video = 1,
-    Playlist = 2,
+    Song = 0
+    Video = 1
+    Playlist = 2
     Album = 3
+    Artist = 4
+    Episode = 5
 
 
 class AudioNode(ABSTRACT):
@@ -67,20 +73,9 @@ class AudioNode(ABSTRACT):
     def getImageUrl(self) -> Optional[str]:
         return None
 
-    # TODO handle exceptions
-    def getInfo(self, link):
-        with YoutubeDL(self.guildContext.YDL_OPTIONS_FOR_AUDIO) as ydl:
-            info = ydl.extract_info(link, download=False)
-            if info is None:
-                raise InvalidLinkException()
-            return info
-
+    @abstractmethod
     def getSource(self):
-        info = getInfo(self, self.getLink())
-        audioSource = info.get("url", "Unknown")
-        if audioSource == "Unknown":
-            raise InvalidLinkException()
-        return audioSource
+        raise InvalidLinkException
 
     @abstractmethod
     def makeEmbed(self) -> Embed:
@@ -97,10 +92,22 @@ class YoutubeAudioNode(AudioNode):
     def getImageUrl(self) -> Optional[str]:
         return self.thumbnailUrl
 
+    # TODO handle exceptions
+    @staticmethod
+    def getInfo(link, YDL_OPTIONS):
+        with YoutubeDL(YDL_OPTIONS) as ydl:
+            info = ydl.extract_info(link, download=False)
+            if info is None:
+                raise InvalidLinkException()
+            return info
+
     def getSource(self):
-        info = self.getInfo(self.getLink())
+        info = self.getInfo(self.getLink(), self.guildContext.YDL_OPTIONS_FOR_AUDIO)
         audioSource = info.get("url", "Unknown")
-        self.thumbnailUrl = info["thumbnails"][-1]["url"]
+        try:
+            self.thumbnailUrl = info["thumbnails"][-1]["url"]
+        except KeyError:
+            self.thumbnailUrl = None
         if audioSource == "Unknown":
             raise InvalidLinkException()
         return audioSource
@@ -163,62 +170,80 @@ class YoutubeAudioNode(AudioNode):
             raise NoSearchResultsException
 
 
+class SpotifyAudioNode(AudioNode):
+
+    def __init__(self, spotifyId: str, requester: User, guildContext: "GuildVoiceContext",
+                 duration: int, title: str, uploader: str, thumbnailUrl, albumName: str):
+        super().__init__(f"https://open.spotify.com/track/{spotifyId}", requester, guildContext, duration, title)
+        self.uploader: str = uploader
+        self.thumbnailUrl = thumbnailUrl
+        self.albumName = albumName
+        self.spotifyId = spotifyId
+
+    def getImageUrl(self) -> Optional[str]:
+        return self.thumbnailUrl
+
+    def makeEmbed(self) -> Embed:
+        sourceEmoji = "🎶"
+        desc = f"{sourceEmoji} ``{self.getTitle()}``"
+        desc += f"\n▶ Playing from [Spotify]({self.getLink()})"
+        embed = Embed(
+            description=desc,
+            colour=Color.blue()
+        )
+        embed.set_thumbnail(self.thumbnailUrl)
+        embed.set_author(name="NOW PLAYING")  # , icon_url=self.nodeBeingPlayed.getImageAddedBy())
+        embed.add_field(name="Added By", value=f"<@{self.requester.id}>", inline=True)
+        embed.add_field(name="Duration", value=formatDuration(self.duration), inline=True)
+        embed.add_field(name="Song By", value=self.uploader, inline=True)
+        return embed
+
+    def getYoutubeInfo(self):
+        q = "{}, {}, {}".format(
+            self.title,
+            self.uploader,
+            self.albumName
+        )
+        return YoutubeAudioNode.searchYTFirstResult(q, self.guildContext.YDL_OPTIONS_FOR_AUDIO)
+
+    def getSource(self):
+        info = self.getYoutubeInfo()
+        audioSource = info.get("url", "Unknown")
+        if audioSource == "Unknown":
+            raise InvalidLinkException()
+        return audioSource
+
+    @staticmethod
+    def isSpotifyLink(link):
+        # return bool(re.findall(r"^(?:https?://)?open.spotify.com/(?:album|track|playlist)/(?:\d|[a-z]|[A-Z]){22}",
+        # link))
+        return bool(re.findall(r"^(?:https?://)?open.spotify.com", link))
+
+    @staticmethod
+    def parseSpotifyURL(url: str) -> tuple[MediaType, str] | tuple[None, None]:
+        results = re.findall(
+            r"^(?:https?://)?open.spotify.com/(album|track|playlist|artist)/((?:\d|[a-z]|[A-Z]){22})"
+            , url)
+        if len(results) <= 0 or len(results[0]) < 2 or len(results[0][1]) != 22:
+            return None, None
+        match results[0][0]:
+            case "album":
+                return MediaType.Album, results[0][1]
+            case "playlist":
+                return MediaType.Playlist, results[0][1]
+            case "track":
+                return MediaType.Song, results[0][1]
+            case "artist":
+                return MediaType.Artist, results[0][1]
+            case _:
+                return None, None
+
+
 test = False
 if test:
-    __links = [
-        "https://www.youtube.com/watch?v=8OkpRK2_gVs&list=PLeqaNXpdZ1sV2WkdT5vGflfJFCAK4NFtg&index=3&t=1s"
-    ]
-    for __link in __links:
-        print(YoutubeAudioNode.isYoutubeLink(__link), YoutubeAudioNode.parseYoutubeURL(__link), __link)
-if test:
-    __links = [
-        "https://www.youtube.com/playlist?list=PLeqaNXpdZ1sV2WkdT5vGflfJFCAK4NFtg"
-    ]
-    for __link in __links:
-        print(re.findall(r"^.*?(?:v|list)=(.*?)(?:&|$)", __link))
-        print(YoutubeAudioNode.parseYoutubeURL(__link))
-
-'''
-with open("cogs/ActiveYouTubeURLFormats.txt", "r+") as f:
-    lines = [i for i in "".join(f.readlines()).split("\n") if i != ""]
-    # lines += ["youtube.com.pt", "youtube.pt", "youtube.co.pt", "https://www.youtube.pt"]
-    lines = [YoutubeAudioNode.parseYoutubeURL(i) for i in lines]
-    # lines = [re.findall(r'(?:https?://)?(?:[-\w.]|(?:%[\da-fA-F]{2}))+', i)[0] for i in lines]
-    lines = sorted(set(lines))
-    for line in lines:
-        print(line)
-
-with open("cogs/countryVariants.txt") as f:
-    lines = [i for i in "".join(f.readlines()).split("\n") if i != ""]
-    l1 = []
-    l2 = []
-    l3 = []
-    for line in lines:
-        line = line.split(".")
-        assert line[0] == "youtube"
-        if len(line) == 2:
-            l1.append(line[1])
-        elif line[1] == "com":
-            l2.append(line[2])
-        elif line[1] == "co":
-            l3.append(line[2])
-        else:
-            assert False
-    d = {
-        k: ("1" if k in l1 else "") + ("2" if k in l2 else "") + ("3" if k in l3 else "")
-        for k in sorted(set(l1+l2+l3))
-    }
-    d2 = {
-        dv: [k for k, v in d.items() if v == dv]
-        for dv in d.values()
-    }
-    for k, v in d.items():
-        print(k, v)
-
-    for k, v in d2.items():
-        print(k, v)
-    print(lines)
-'''
+    uLink = "https://open.spotify.com/playlist/7hGG8g2WqzRN0fcc1fg2T9"
+    print(SpotifyAudioNode.isSpotifyLink(uLink))
+    print(SpotifyAudioNode.parseSpotifyURL(uLink))
 
 
 class SongAddedData:
@@ -227,11 +252,14 @@ class SongAddedData:
         self.image = image
 
     def getEmbed(self):
+
+        desc = "\n".join([
+            f"\\[[{formatDuration(song.getDuration())}]({song.getLink()})\\] ``{song.getTitle():.50}`` "
+            for song in self.songs[:15]])
+        if (remSongs := len(self.songs[15:])) > 0:
+            desc += f"\n...and other {remSongs} songs."
         embed = Embed(
-            description="\n".join([
-                f"\\[[{formatDuration(song.getDuration())}]({song.getLink()})\\] ``{song.getTitle():.50}`` "
-                for song in self.songs
-            ]),  # TODO maybe fix the getTitle max with "..."
+            description=desc,
             colour=Color.blue()
         )
         embed.set_author(name="Added to Queue")
@@ -249,31 +277,15 @@ class NodePseudoFactory:
     def __init__(self, guildContext):
         self.guildContext: "GuildVoiceContext" = guildContext
 
-    # TODO handle exceptions
-    def getInfo(self, link):
-        with YoutubeDL(self.guildContext.YDL_OPTIONS_FOR_AUDIO) as ydl:
-            info = ydl.extract_info(link, download=False)
-            if info is None:
-                raise InvalidLinkException()
-            return info
-
     def interpretRequest(self, link, requester):
-        # TODO check for valid link
+        # DONE check for valid link
         cleanLink = re.findall(r'(?:https?://)?(?:[-\w.]|(?:%[\da-fA-F]{2}))+', link)[0]
-        if not isUrlValid(link):  # if text -> yt
-            info = YoutubeAudioNode.searchYTFirstResult(link, self.guildContext.YDL_OPTIONS_FOR_AUDIO)
-            self.guildContext.queue.put(node := YoutubeAudioNode(
-                info["original_url"], requester, self.guildContext,
-                duration=info["duration"], title=info["title"], uploader=info["uploader"],
-                thumbnailUrl=info["thumbnails"][-1]["url"]
-            ))
-            return SongAddedData(node)
-        elif YoutubeAudioNode.isYoutubeLink(cleanLink):
+        if YoutubeAudioNode.isYoutubeLink(cleanLink):
             mediaType, link = YoutubeAudioNode.parseYoutubeURL(link)
             match mediaType:
                 case MediaType.Video:
-                    # TODO validate video
-                    info = self.getInfo(link)
+                    # DONE validate video: getInfo returns InvalidLinkException!
+                    info = YoutubeAudioNode.getInfo(link, self.guildContext.YDL_OPTIONS_FOR_AUDIO)
                     self.guildContext.queue.put(node := YoutubeAudioNode(
                         link, requester, self.guildContext,
                         duration=info["duration"], title=info["title"], uploader=info["uploader"],
@@ -282,11 +294,14 @@ class NodePseudoFactory:
                     return SongAddedData(node)
 
                 case MediaType.Playlist:
-                    info = YoutubeAudioNode.getInfoPlaylist(link, self.guildContext.cogMain.YDL_OPTIONS_PLAYLIST)
+                    info = YoutubeAudioNode.getInfoPlaylist(link, self.guildContext.YDL_OPTIONS_PLAYLIST)
 
-                    # TODO validate videos
+                    # DONE validate videos: if duration is None then the video wouldn't play!
                     songsAdded = []
                     for entry in info["entries"]:
+                        if entry.get("duration", None) is None:
+                            # TODO tell skipped videos
+                            continue
                         self.guildContext.queue.put(node := YoutubeAudioNode(
                             entry["url"], requester, self.guildContext,
                             duration=entry["duration"], title=entry["title"], uploader=entry["uploader"],
@@ -294,9 +309,101 @@ class NodePseudoFactory:
                         ))
                         songsAdded.append(node)
                     return SongAddedData(songsAdded)
+        elif SpotifyAudioNode.isSpotifyLink(cleanLink):
+            mediaType, spotify_id = SpotifyAudioNode.parseSpotifyURL(link)
+            if mediaType is None or spotify_id is None:
+                InvalidLinkException()
+            if mediaType == MediaType.Song:
+                track = self.guildContext.cogMain.spotifyClient.track(track_id=spotify_id)
+                self.guildContext.queue.put(node := SpotifyAudioNode(
+                    f"open.spotify.com/track/{track['id']}", requester, self.guildContext,
+                    duration=round(track["duration_ms"] / 1000), title=track["name"],
+                    uploader=track["artists"][0]["name"],
+                    thumbnailUrl=track["album"]["images"][0]["url"], albumName=track['album']['name']
+                ))
+                return SongAddedData(node)
+            elif mediaType == MediaType.Album:
+                album_tracks_response = self.guildContext.cogMain.spotifyClient.album_tracks(album_id=spotify_id)
+                album_response = self.guildContext.cogMain.spotifyClient.album(album_id=spotify_id)
+                image = album_response["images"][0]["url"]
+                album_items = album_tracks_response['items']
+                addedNodes = []
+                for item in album_items:
+                    track = item
+                    self.guildContext.queue.put(node := SpotifyAudioNode(
+                        f"open.spotify.com/track/{track['id']}", requester, self.guildContext,
+                        duration=round(track["duration_ms"] / 1000), title=track["name"],
+                        uploader=track["artists"][0]["name"],
+                        thumbnailUrl=image, albumName=album_response['name']
+                    ))
+                    addedNodes.append(node)
+                return SongAddedData(addedNodes, image)
+            elif mediaType == MediaType.Playlist:
+                playlist_response = self.guildContext.cogMain.spotifyClient.playlist(playlist_id=spotify_id)
+                image = playlist_response["images"][0]["url"]
+                playlist_items = playlist_response['tracks']['items']
+                addedNodes = []
+                for item in playlist_items:
+                    track = item.get("track", None)
+                    if track is None:
+                        continue
+                    self.guildContext.queue.put(node := SpotifyAudioNode(
+                        f"open.spotify.com/track/{track['id']}", requester, self.guildContext,
+                        duration=round(track["duration_ms"] / 1000), title=track["name"],
+                        uploader=track["artists"][0]["name"],
+                        thumbnailUrl=track["album"]["images"][0]["url"], albumName=track['album']['name']
+                    ))
+                    addedNodes.append(node)
+                return SongAddedData(addedNodes, image=image)
+            elif mediaType == MediaType.Artist:
+                artist_response = self.guildContext.cogMain.spotifyClient.artist_top_tracks(artist_id=spotify_id)
+                artist = self.guildContext.cogMain.spotifyClient.artist(artist_id=spotify_id)
+                addedNodes = []
+                for track in artist_response['tracks']:
+                    self.guildContext.queue.put(node := SpotifyAudioNode(
+                        f"open.spotify.com/track/{track['id']}", requester, self.guildContext,
+                        duration=round(track["duration_ms"] / 1000), title=track["name"],
+                        uploader=track["artists"][0]["name"],
+                        thumbnailUrl=track["album"]["images"][0]["url"], albumName=track['album']['name']
+                    ))
+                    addedNodes.append(node)
+                return SongAddedData(addedNodes, image=artist["images"][0]["url"])
+        elif not isUrlValid(link):  # if text -> yt
+            info = YoutubeAudioNode.searchYTFirstResult(link, self.guildContext.YDL_OPTIONS_FOR_AUDIO)
+            self.guildContext.queue.put(node := YoutubeAudioNode(
+                info["original_url"], requester, self.guildContext,
+                duration=info["duration"], title=info["title"], uploader=info["uploader"],
+                thumbnailUrl=info["thumbnails"][-1]["url"]
+            ))
+            return SongAddedData(node)
+        raise InvalidLinkException()  # provider not available
 
-        else:  # provider not available
-            raise InvalidLinkException()
+
+class LoggerOutputs:
+    def __init__(self):
+        pass
+
+    def error(self, msg):
+        pass
+        # print("Captured Error: " + msg)
+
+    def warning(self, msg):
+        pass
+        # print("Captured Warning: " + msg)
+
+    def debug(self, msg):
+        pass
+        # print("Captured Log: " + msg)
+
+
+class EmptyLoggerOutputs:
+    def __init__(self):
+        self.error = self.nothing
+        self.warning = self.nothing
+        self.debug = self.nothing
+
+    def nothing(self, msg):
+        pass
 
 
 class CommandQueueHandler:
@@ -319,22 +426,26 @@ class CommandQueueHandler:
         self.inLoop = True
         while not self.commandQueue.empty():
             self.commandLoopLock.release()
-            self.commandQueue.get()()
+            func, args, kwargs = self.commandQueue.get()
+            func(*args, **kwargs)
             self.commandLoopLock.acquire()
         self.inLoop = False
         self.commandLoopLock.release()
 
-    def skip(self):
-        self.commandQueue.put(self.__skip)
+    def skip(self, count=1):
+        self.commandQueue.put((self.__skip, [], {"count": count}))
         self.wakeUpCommandLoop()
 
-    def __skip(self):
-        self.guildContextloggerBit = False
+    def __skip(self, count=1):
         with self.guildContext.lock:
-            self.guildContext.getVoiceClient().stop()
+            if count > 1:
+                for _ in range(0, count - 1):
+                    self.guildContext.queue.get()
+            if count >= 1:
+                self.guildContext.getVoiceClient().stop()
 
     def stop(self):
-        self.commandQueue.put(self.__stop)
+        self.commandQueue.put((self.__stop, [], {}))
         self.wakeUpCommandLoop()
 
     def __stop(self):
@@ -344,7 +455,7 @@ class CommandQueueHandler:
             self.guildContext.getVoiceClient().stop()
 
     def pause(self):
-        self.commandQueue.put(self.__stop)
+        self.commandQueue.put((self.__pause, [], {}))
         self.wakeUpCommandLoop()
 
     def __pause(self):
@@ -354,6 +465,13 @@ class CommandQueueHandler:
                 vClient.resume()
             else:
                 vClient.pause()
+
+    def setLoopMode(self, loopMode: LoopMode):
+        self.commandQueue.put((self.__setLoopMode, [], {"loopMode": loopMode}))
+        self.wakeUpCommandLoop()
+
+    def __setLoopMode(self, loopMode: LoopMode):
+        self.guildContext.loopMode = loopMode
 
 
 class GuildVoiceContext:
@@ -370,11 +488,17 @@ class GuildVoiceContext:
         self.commandHandler = CommandQueueHandler(self)
         self.lock = threading.Lock()
 
-        self.YDL_OPTIONS_FOR_AUDIO = cogMain.YDL_OPTIONS_FOR_AUDIO
+        # TODO add autodisconnect after some other time of inactivity
+        # TODO add *functional* logger
+        # TODO fix sequential /play (probably result of put play in commandQueue)
+        self.logger = EmptyLoggerOutputs()  # DONE add logger
+        self.logger = LoggerOutputs()
+        self.YDL_OPTIONS_FOR_AUDIO = cogMain.YDL_OPTIONS_FOR_AUDIO.copy()
+        self.YDL_OPTIONS_FOR_AUDIO['logger'] = self.logger
+        self.YDL_OPTIONS_PLAYLIST = cogMain.YDL_OPTIONS_PLAYLIST.copy()
+        self.YDL_OPTIONS_PLAYLIST['logger'] = self.logger
         self.ffmpegExePath = cogMain.ffmpegExePath
         self.FFMPEG_OPTIONS = cogMain.FFMPEG_OPTIONS
-
-        # TODO add logger
 
     def calculateQueueDuration(self):  # in seconds
         return sum([node.getDuration() for node in self.queue.queue])
@@ -406,7 +530,10 @@ class GuildVoiceContext:
                 ffmpegAudioSource: AudioSource = FFmpegPCMAudio(
                     executable=self.ffmpegExePath, source=audioSource, **self.FFMPEG_OPTIONS
                 )
-                self.getVoiceClient().play(ffmpegAudioSource, after=lambda e: self.playNext())
+                self.getVoiceClient().play(
+                    ffmpegAudioSource, after=lambda e: self.playNext(),
+
+                )
 
                 await self.deletePreviousNowPlayingMessage()
                 await self.sendNowPlayingMessage()
@@ -423,24 +550,6 @@ class GuildVoiceContext:
 
     async def sendNowPlayingMessage(self):
         self.nodePlaying: AudioNode
-        '''
-        sourceEmoji = "🎶"
-        desc = f"``{self.nodeBeingPlayed.title}``**``\nBy: {sourceEmoji}{self.nodeBeingPlayed.author}" \
-               f"\n```Duration Bar```\n" \
-               f"Added By: {self.nodeBeingPlayed.getNameOfAddedBy()}"
-        desc = f"{sourceEmoji}``{self.nodeBeingPlayed.title}``"
-        desc += f"\n▶ Playing from [{self.nodeBeingPlayed.type.value}]({self.nodeBeingPlayed.link})"
-
-        embed = Embed(
-            description=desc,
-            colour=Color.blue()
-        )
-        embed.set_author(name="NOW PLAYING", icon_url=self.nodeBeingPlayed.getImageAddedBy())
-        embed.add_field(name="Added By", value=self.nodeBeingPlayed.getPingAddedBy(), inline=True)
-        embed.add_field(name="Song By", value=self.nodeBeingPlayed.author, inline=True)
-        embed.add_field(name="Duration", value=formatDuration(self.nodeBeingPlayed.duration), inline=True)
-        self.lastNowPlayingMessage = await self.currentTextChannel.send(embed=embed)
-        '''
         self.lastNowPlayingMessage = await self.replyChannel.send(embed=self.nodePlaying.makeEmbed())
 
     def getVoiceClient(self) -> VoiceClient:
@@ -461,29 +570,69 @@ class GuildVoiceContext:
     def pause(self):
         self.commandHandler.pause()
 
-    def skip(self):
-        self.commandHandler.skip()
+    def skip(self, jumpTo):
+        self.commandHandler.skip(jumpTo)
 
     def stop(self):
         self.commandHandler.stop()
 
+    def setLoopMode(self, loopMode: LoopMode):
+        self.commandHandler.setLoopMode(loopMode)
+
+    def getQueue(self, n: int) -> (list[dict], int):
+        if n < 0:
+            n = 0
+        if n * 15 > len(self.queue.queue):
+            n = len(self.queue.queue) // 15
+        return [{
+            "duration": node.getDuration(),
+            "url": node.getLink(),
+            "title": node.getTitle()
+        } for node in list(self.queue.queue)[n * 15: (n + 1) * 15]], n
+
+
+class ComponentsView(nextcord.ui.View):
+
+    def __init__(self, components):
+        super().__init__()
+        for comp in components:
+            self.add_item(comp)
+
+
+class QueueButton(nextcord.ui.Button):
+    def __init__(self, guildContext: GuildVoiceContext, page: int, isRight: bool, **kwargs):
+        super().__init__(emoji="➡" if isRight else "⬅", **kwargs)
+        self.guildContext = guildContext
+        self.page = page
+
+    async def callback(self, interaction: nextcord.Interaction):
+        songList, page = self.guildContext.getQueue(self.page)
+        embed, view = MusicCog.makeQueueEmbed(songList, page, self.guildContext)
+        await interaction.message.edit(embed=embed, view=view)
+
 
 class MusicCog(Cog):
+
     def __init__(self, client, botMain):
         self.client = client
         self.botMain = botMain
         self.guildContexts = {}
+        cred = getJson(path=botMain.path + "/cred/spotify_dev.json")
+        self.spotifyClient = spotipy.Spotify(
+            auth_manager=SpotifyClientCredentials(
+                client_id=cred["client_id"], client_secret=cred["client_secret"]
+            ))
         self.YDL_OPTIONS_FOR_AUDIO = {
             'format': 'bestaudio/bestaudio*',
             'noplaylist': True,
             'quiet': True,
-            'ignoreerrors': True,
+            'ignore_errors': True,
             'age_limit': 69
         }
         self.YDL_OPTIONS_PLAYLIST = {
             "extract_flat": "in_playlist",
             'quiet': True,
-            'ignoreerrors': True,
+            'ignore_errors': True,
             'skip_download': True,
             'age_limit': 69,
             'hls-prefer-ffmpeg': True,
@@ -554,16 +703,34 @@ class MusicCog(Cog):
             await msg.edit(embed=addedData.getEmbed())
         except InvalidLinkException:
             await msg.edit("Invalid Link Exception")
+        except NoSearchResultsException:
+            await msg.edit("No results were found for the given query.")
 
-    @slash_command("test3")
-    async def forcePlay(self, inter: Interaction):
+    @slash_command("test2")
+    async def forcePlay2(self, inter: Interaction):
         link: str = "https://youtu.be/YTQV48V44Sw?si=__Pql104Xd-6aKKd"
         await self.guarantee(inter)
         guildContext: GuildVoiceContext = self.getGuildContext(inter.guild)
-        with YoutubeDL(self.YDL_OPTIONS_FOR_AUDIO) as ydl:
-            info = ydl.extract_info(link, download=False)
-            if info is None:
-                raise InvalidLinkException()
+
+        # link: str = "https://open.spotify.com/track/5SGesS47gTWra708Z5LhVe?si=428c2591ce7b4a83"
+
+        pl_id = '6ZkwfPHoQFEvxtuXf6dUnr'
+        pl_id = '1lfVSnY49aGFPkiSXaWR6T'
+        sp = self.spotifyClient
+        playlist_response = sp.playlist(playlist_id=pl_id)
+        name = playlist_response['name']
+        playlist_items = playlist_response['tracks']['items']
+
+        q = [
+            "{} {} {}".format(
+                item['track']['name'],
+                item['track']['artists'][0]['name'],
+                item['track']['album']['name']
+            )
+            for item in playlist_items
+        ]
+
+        info = YoutubeAudioNode.searchYTFirstResult(q[0], self.YDL_OPTIONS_FOR_AUDIO)
         audioSource = info.get("url", "Unknown")
 
         ffmpegAudioSource: AudioSource = FFmpegPCMAudio(
@@ -580,18 +747,90 @@ class MusicCog(Cog):
         await inter.send("paused" if guildContext.isPaused() else "resumed")
 
     @slash_command("skip")
-    async def skip(self, inter: Interaction):
+    async def skip(self, inter: Interaction, jump_to: int = SlashOption(
+        required=False, min_value=1, max_value=500, default=1,
+        name="jump_to", description="the number of song the you wish to skip to"
+    )):
         await self.guarantee(inter)
         guildContext: GuildVoiceContext = self.getGuildContext(inter.guild)
-        guildContext.skip()
         await inter.send("skipped")
+        guildContext.skip(jump_to)
 
     @slash_command("stop")
     async def stop(self, inter: Interaction):
         await self.guarantee(inter)
         guildContext: GuildVoiceContext = self.getGuildContext(inter.guild)
-        guildContext.stop()
         await inter.send("stopped")
+        guildContext.stop()
+
+    @staticmethod
+    def makeQueueEmbed(songList, page, guildContext):
+        desc = "\n".join([f"**Page {page + 1}:**"] + [
+            f"``[{1 + i + page * 15:02}]``\\[[{formatDuration(song['duration'])}]({song['url']})\\] ``{song['title']:.50}``"
+            for i, song in enumerate(songList)
+        ])
+        embed = Embed(
+            description=desc,
+            colour=Color.blue()
+        )
+        embed.set_author(name="QUEUE")
+        view = ComponentsView([
+            QueueButton(guildContext, page - 1, False),
+            QueueButton(guildContext, page + 1, True),
+
+        ])
+        return embed, view
+
+    @slash_command("queue")
+    async def queue(self, inter: Interaction, page: int = SlashOption(
+        required=False, min_value=1, max_value=50, default=1,
+        name="page", description="the page of 15 songs in the queue"
+    )):
+        await self.guarantee(inter)
+        guildContext: GuildVoiceContext = self.getGuildContext(inter.guild)
+        msg = await self.getSendingRequestMessage(inter)
+        # TODO don't allow if there are no songs
+        songList, page = guildContext.getQueue(page - 1)
+        embed, view = self.makeQueueEmbed(songList, page, guildContext)
+        await msg.edit(embed=embed, view=view)
+
+    @slash_command("loop")
+    async def loop(self, inter: Interaction, loopMode: int = SlashOption(
+        required=True, choices={
+            "Song": 1,
+            "Queue": 2,
+            "Disabled": 0
+        },
+        name="loop_mode", description="The loop mode you want to change the bot to"
+    )):
+        await self.guarantee(inter)
+        # TODO loop ain't working whatsever :skull:
+        guildContext: GuildVoiceContext = self.getGuildContext(inter.guild)
+        await inter.send("loop mode changed")
+        guildContext.setLoopMode(LoopMode(loopMode))
+
+    @slash_command("test3")
+    async def choose_a_number(
+            self,
+            interaction: nextcord.Interaction,
+            number: int = SlashOption(
+                name="picker",
+                choices={
+                    "one": 1,
+                    "two": 2,
+                    "three": 3},
+            ),
+    ):
+        """Repeats your number that you choose from a list
+
+        Parameters
+        ----------
+        interaction: Interaction
+            The interaction object
+        number: int
+            The chosen number.
+        """
+        await interaction.response.send_message(f"You chose {number}!")
 
 
 def setup(client, botMain):

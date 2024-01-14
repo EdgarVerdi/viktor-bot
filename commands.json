@@ -34,5 +34,13 @@
   "play" : {
     "name": "play",
     "description" : "Adds a song to the queue"
+  },
+  "queue": {
+    "name": "queue",
+    "description" : "Shows the queue"
+  },
+  "loop": {
+	  "name": "loop",
+	  "description" : "tenho preguiça mudo dps"
   }
 }
